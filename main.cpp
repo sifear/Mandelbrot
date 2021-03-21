@@ -20,12 +20,13 @@
 #include <cmath> 
 #include "pixel.h"
 #include "palette.h"
-#include "main.h"
+#include <immintrin.h>
+#include <atomic>
 
 
-#define SCREEN_WIDTH 800
-#define SCREEN_HEIGHT 600
-#define NUMBER_OF_THREADS 16
+#define SCREEN_WIDTH 1920
+#define SCREEN_HEIGHT 1080
+#define NUMBER_OF_THREADS 1
 
 std::mutex buffer_mutex;
 std::mutex Queue_Mutex;
@@ -34,20 +35,82 @@ std::condition_variable condition;
 std::queue<std::function<void()>> Queue;
 
 Pixel image[SCREEN_WIDTH * SCREEN_HEIGHT];
-Uint8 counter = 0;
+std::atomic<Uint8> counter = 0;
 int x_axis_offset = 0;
 int y_axis_offset = 0;
+float scale = 1;
 
 Pixel palette[2048];
 
-Pixel linear_interpolate(Pixel p1, Pixel p2) {
-	Pixel newPixel;
+void drawAllPixels_SSE(SDL_Renderer* renderer, int thread_no) {
+	int upper_limit = (SCREEN_WIDTH / NUMBER_OF_THREADS) * thread_no;
+	int lower_limit = upper_limit - (SCREEN_WIDTH / NUMBER_OF_THREADS);
 
-	newPixel.red = std::min((p1.red + p2.red) / 2, 255);
-	newPixel.green = std::min((p1.green + p2.green) / 2, 255);
-	newPixel.blue = std::min((p1.blue + p2.blue) / 2, 255);
+	for (int i = lower_limit; i < upper_limit; i++) {
+		float _i[4] = { i };
+		for (int j = 0; j < SCREEN_HEIGHT; j++) {
+			__m128 x0 = _mm_load_ps(_i);
+			float x_multipier = 3.5f / (float)SCREEN_WIDTH - 2.5f;
+			float x_multipier_a[4] = { x_multipier };
+			__m128 _x_multipier_a = _mm_load_ps(x_multipier_a);
 
-	return newPixel;
+			float x_additive = (float)x_axis_offset / 10.0f;
+			float x_additive_a[4] = { x_additive };
+			__m128 _x_additive_a = _mm_load_ps(x_additive_a);
+
+			x0 = _mm_mul_ps(x0, _x_multipier_a);
+			x0 = _mm_add_ps(x0, _x_additive_a);
+
+			float x_divisor = (float)scale;
+			float x_divisor_a[4] = { x_divisor };
+			__m128 _x_divisor_a = _mm_load_ps(x_divisor_a);
+
+			x0 = _mm_div_ps(x0, _x_divisor_a);
+
+			float f_x0[4] = { 0 };
+			_mm_store_ps(f_x0, x0);
+
+			//float x0 = (float)i / ((float)SCREEN_WIDTH / 3.5f) - 2.5f + (float)x_axis_offset / 10.0f;
+			//x0 /= scale;
+
+			float y0[4] = { j / (SCREEN_HEIGHT / 2.0f) - 1.0f + (float)y_axis_offset / 10.0f };
+			for (size_t k = 0; k < 4; k++)
+			{
+				y0[k] /= scale;
+			}
+			float x[4] = { 0.0f };
+			float y[4] = { 0.0f };
+			int iteration[4] = { 0 };
+			int max_iteration = 100 ;
+
+			for (size_t l = 0; l < 4; l++)
+			{
+				while (x[l] * x[l] + y[l] * y[l] <= 4.0f && iteration[l] < max_iteration) {
+					float xtemp = x[l] * x[l] - y[l] * y[l] + f_x0[l];
+					y[l] = 2.0f * x[l] * y[l] + y0[l];
+					x[l] = xtemp;
+					iteration[l] = iteration[l] + 1;
+				}
+			}
+
+			int colorI = 0;
+			for (size_t l = 0; l < 4; l++)
+			{
+				float smoothed = log2(log2(x[l] * x[l] + y[l] * y[l]) / 2.0f);  // log_2(log_2(|p|))
+				colorI = (int)(sqrt((float)iteration[l] + 10.0f - smoothed) * 256.0f) % 2048;
+			}
+
+
+			Pixel color1;
+			color1.red = red_palette[(int)floor(colorI)];
+			color1.green = green_palette[(int)floor(colorI)];
+			color1.blue = blue_palette[(int)floor(colorI)];
+
+			image[SCREEN_WIDTH * j + i].red = color1.red;
+			image[SCREEN_WIDTH * j + i].green = color1.green;
+			image[SCREEN_WIDTH * j + i].blue = color1.blue;
+		}
+	}
 }
 
 void drawAllPixels(SDL_Renderer* renderer, int thread_no) {
@@ -56,21 +119,23 @@ void drawAllPixels(SDL_Renderer* renderer, int thread_no) {
  
 	for (int i = lower_limit; i < upper_limit; i++) {
 		for (int j = 0; j < SCREEN_HEIGHT; j++) {
-			double x0 = (double)i / ((double)SCREEN_WIDTH / 3.5) - 2.5 + (double)x_axis_offset / 100.0;
-			double y0 = j / (SCREEN_HEIGHT / 2.0) - 1.0 + (double)y_axis_offset / 100.0;
-			double x = 0.0;
-			double y = 0.0;
+			float x0 = (float)i / ((float)SCREEN_WIDTH / 3.5f) - 2.5f + (float)x_axis_offset / 10.0f;
+			float y0 = j / (SCREEN_HEIGHT / 2.0f) - 1.0f + (float)y_axis_offset / 10.0f;
+			x0 /= scale;
+			y0 /= scale;
+			float x = 0.0f;
+			float y = 0.0f;
 			int iteration = 0;
 			int max_iteration = 100;
-			while (x * x + y * y <= 4.0 && iteration < max_iteration) {
-				double xtemp = x * x - y * y + x0;
-				y = 2.0 * x * y + y0;
+			while (x * x + y * y <= 4.0f && iteration < max_iteration) {
+				float xtemp = x * x - y * y + x0;
+				y = 2.0f * x * y + y0;
 				x = xtemp;
 				iteration = iteration + 1;
 			}
 
-			double smoothed = log2(log2(x * x + y * y) / 2);  // log_2(log_2(|p|))
-			int colorI = (int)(sqrt((double)iteration + 10.0 - smoothed) * 256.0) % 2048;
+			float smoothed = log2(log2(x * x + y * y) / 2.0f);  // log_2(log_2(|p|))
+			int colorI = (int)(sqrt((float)iteration + 10.0f - smoothed) * 256.0f) % 2048;
 
 			Pixel color1;
 			color1.red = red_palette[(int)floor(colorI)];
@@ -103,6 +168,14 @@ bool OnEvent(SDL_Event* event) {
 		else if (event->key.keysym.sym == SDLK_RIGHT) {
 			x_axis_offset -= 1;
 		}
+		else if (event->key.keysym.sym == SDLK_KP_PLUS)
+		{
+			scale += 1;
+		}
+		else if (event->key.keysym.sym == SDLK_KP_MINUS)
+		{
+			scale -= 1;
+		}
 	}
 	return true;
 }
@@ -116,7 +189,7 @@ void add(std::function<void()> new_job) {
 }
 
 void Infinite_loop_function() {
-	//std::cout << "in infinite loop function" << std::endl;
+	std::cout << "in infinite loop function, " << (int)counter << "." << std::endl;
 	std::function<void()>  Job;
 	while (true)
 	{
@@ -142,6 +215,7 @@ void initThreads(std::thread pool[NUMBER_OF_THREADS]) {
 
 void spawnThreads(SDL_Renderer* renderer) {
 	counter = NUMBER_OF_THREADS;
+	std::cout << "spawning threads, " << (int)counter << std::endl;
 
 	for (int i = 0; i < NUMBER_OF_THREADS; i++) {
 		add(std::bind(&drawAllPixels, renderer, i + 1));
@@ -164,6 +238,8 @@ int main(int argc, char* args[]) {
 	SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
 	SDL_RenderClear(renderer);
 
+	std::cout << "After clear" << std::endl;
+
 	Uint64 NOW = SDL_GetPerformanceCounter();
 	Uint64 LAST = 0;
 	double deltaTime = 0;
@@ -171,6 +247,8 @@ int main(int argc, char* args[]) {
 
 	std::thread thread_pool[NUMBER_OF_THREADS];
 	initThreads(thread_pool);
+
+	std::cout << "After init threads" << std::endl;
 
 	texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, SCREEN_WIDTH, SCREEN_HEIGHT);
 
@@ -183,7 +261,10 @@ int main(int argc, char* args[]) {
 		}
 
 		spawnThreads(renderer);
-		while (counter != 0) {}
+		while (counter > 0) {
+			//std::cout << std::endl;
+		}
+		std::cout << "After init infinite loop" << std::endl;
 
 		SDL_UpdateTexture(texture, NULL, image, SCREEN_WIDTH * (int)sizeof(Pixel));
 		SDL_RenderCopy(renderer, texture, NULL, NULL);
